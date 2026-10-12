@@ -203,9 +203,9 @@ pub fn calculate_swap_change(
     slippage_bps: u64,
 ) -> Result<ClmmSwapChangeResult> {
     let pool_state =
-        rpc::get_anchor_account::<raydium_amm_v3::states::PoolState>(rpc_client, &pool_id)
-            .unwrap()
-            .unwrap();
+        rpc::get_anchor_account::<raydium_amm_v3::states::PoolState>(rpc_client, &pool_id)?
+            .ok_or(anyhow::anyhow!("Unable to fetch pool state"))?;
+
     // load mult account
     let load_accounts = vec![
         input_token,
@@ -227,11 +227,16 @@ pub fn calculate_swap_change(
         deserialize_anchor_account::<raydium_amm_v3::states::TickArrayBitmapExtension>(
             tickarray_bitmap_extension_account.as_ref().unwrap(),
         )
-        .unwrap();
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "Cannot deserialize tickarray_bitmap_extension_state: {}",
+                err.to_string()
+            )
+        })?;
     let amm_config_state = deserialize_anchor_account::<raydium_amm_v3::states::AmmConfig>(
         amm_config_account.as_ref().unwrap(),
     )
-    .unwrap();
+    .map_err(|err| anyhow::anyhow!("Cannot deserialize amm_config_state: {}", err.to_string()))?;
 
     let (
         zero_for_one,
@@ -638,6 +643,388 @@ fn swap_compute(
 
     Ok((state.amount_calculated, tick_array_start_index_vec))
 }
+
+// ─── Batch API ────────────────────────────────────────────────────────────────
+//
+// These functions allow scanning N pools with a fixed number of RPC calls
+// (4 total, regardless of pool count) instead of O(N*4).
+//
+// Usage pattern:
+//   1. fetch_pool_states_batch()         → all PoolStates, 1 call
+//   2. derive_tick_array_keys_for_pool() → pure math per pool, no RPC
+//   3. fetch_supporting_accounts_batch() → amm_configs + bitmap_exts + shared
+//      accounts, chunked into ≤100-account calls
+//   4. fetch_tick_arrays_batch()         → all tick arrays across all pools,
+//      chunked into ≤100-account calls
+//   5. calculate_swap_change_from_state() × N → pure math, zero RPC
+
+/// Fetch multiple PoolState accounts in a single getMultipleAccounts call.
+/// Returns None for any pool that doesn't exist or fails to deserialize.
+pub fn fetch_pool_states_batch(
+    rpc_client: &RpcClient,
+    pool_ids: &[Pubkey],
+) -> Result<Vec<Option<raydium_amm_v3::states::PoolState>>> {
+    let accounts = rpc_client.get_multiple_accounts(pool_ids)?;
+    let states = accounts
+        .into_iter()
+        .map(|maybe_account| {
+            maybe_account.and_then(|account| {
+                deserialize_anchor_account::<raydium_amm_v3::states::PoolState>(&account).ok()
+            })
+        })
+        .collect();
+    Ok(states)
+}
+
+/// Pre-fetched supporting accounts for a batch swap calculation.
+/// All shared across pools of the same token pair (SOL/USDC etc.).
+pub struct BatchSwapAccounts {
+    /// amm_config per pool (index matches pool_ids order)
+    pub amm_configs: Vec<Option<raydium_amm_v3::states::AmmConfig>>,
+    /// tickarray_bitmap_extension per pool
+    pub bitmap_extensions: Vec<Option<raydium_amm_v3::states::TickArrayBitmapExtension>>,
+    /// token mint 0 account data (shared across pools with same pair)
+    pub mint0: solana_sdk::account::Account,
+    /// token mint 1 account data
+    pub mint1: solana_sdk::account::Account,
+    /// user's input token account data
+    pub user_input_account: solana_sdk::account::Account,
+    /// epoch (for transfer fee calculations)
+    pub epoch: u64,
+}
+
+/// Fetch all supporting accounts for N pools in as few RPC calls as possible.
+/// Accounts fetched: amm_config × N, bitmap_extension × N, mint0, mint1, user_input_token.
+/// Chunked automatically if total > 100 (Solana getMultipleAccounts limit).
+pub fn fetch_supporting_accounts_batch(
+    rpc_client: &RpcClient,
+    pool_states: &[raydium_amm_v3::states::PoolState],
+    bitmap_extension_keys: &[Pubkey],
+    mint0_key: Pubkey,
+    mint1_key: Pubkey,
+    user_input_token: Pubkey,
+) -> Result<BatchSwapAccounts> {
+    let epoch = rpc_client.get_epoch_info()?.epoch;
+
+    // Build full account list: [amm_configs..., bitmap_exts..., mint0, mint1, user_input]
+    let mut keys: Vec<Pubkey> = Vec::new();
+    for ps in pool_states {
+        keys.push(ps.amm_config);
+    }
+    for bk in bitmap_extension_keys {
+        keys.push(*bk);
+    }
+    let shared_start = keys.len();
+    keys.push(mint0_key);
+    keys.push(mint1_key);
+    keys.push(user_input_token);
+
+    // Chunk into ≤100-account calls
+    let all_accounts = fetch_multiple_accounts_chunked(rpc_client, &keys)?;
+
+    let n = pool_states.len();
+
+    let amm_configs = all_accounts[..n]
+        .iter()
+        .map(|maybe| {
+            maybe.as_ref().and_then(|acc| {
+                deserialize_anchor_account::<raydium_amm_v3::states::AmmConfig>(acc).ok()
+            })
+        })
+        .collect();
+
+    let bitmap_extensions = all_accounts[n..shared_start]
+        .iter()
+        .map(|maybe| {
+            maybe.as_ref().and_then(|acc| {
+                deserialize_anchor_account::<raydium_amm_v3::states::TickArrayBitmapExtension>(acc)
+                    .ok()
+            })
+        })
+        .collect();
+
+    let mint0 = all_accounts[shared_start]
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("mint0 account not found"))?;
+    let mint1 = all_accounts[shared_start + 1]
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("mint1 account not found"))?;
+    let user_input_account = all_accounts[shared_start + 2]
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("user input token account not found"))?;
+
+    Ok(BatchSwapAccounts {
+        amm_configs,
+        bitmap_extensions,
+        mint0,
+        mint1,
+        user_input_account,
+        epoch,
+    })
+}
+
+/// Derive tick array PDAs for a pool without making any RPC calls.
+/// Uses the pool's bitmap to find the current + next 5 initialized tick arrays.
+/// Returns the PDAs in swap-direction order.
+pub fn derive_tick_array_keys_for_pool(
+    raydium_v3_program: Pubkey,
+    pool_id: Pubkey,
+    pool_state: &raydium_amm_v3::states::PoolState,
+    bitmap_extension: &raydium_amm_v3::states::TickArrayBitmapExtension,
+    zero_for_one: bool,
+) -> Vec<Pubkey> {
+    let (_, mut current_start_index) = match pool_state
+        .get_first_initialized_tick_array(&Some(*bitmap_extension), zero_for_one)
+    {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+
+    let mut keys = Vec::new();
+    keys.push(
+        Pubkey::find_program_address(
+            &[
+                raydium_amm_v3::states::TICK_ARRAY_SEED.as_bytes(),
+                pool_id.to_bytes().as_ref(),
+                &current_start_index.to_be_bytes(),
+            ],
+            &raydium_v3_program,
+        )
+        .0,
+    );
+
+    for _ in 0..5 {
+        match pool_state.next_initialized_tick_array_start_index(
+            &Some(*bitmap_extension),
+            current_start_index,
+            zero_for_one,
+        ) {
+            Ok(Some(next)) => {
+                current_start_index = next;
+                keys.push(
+                    Pubkey::find_program_address(
+                        &[
+                            raydium_amm_v3::states::TICK_ARRAY_SEED.as_bytes(),
+                            pool_id.to_bytes().as_ref(),
+                            &current_start_index.to_be_bytes(),
+                        ],
+                        &raydium_v3_program,
+                    )
+                    .0,
+                );
+            }
+            _ => break,
+        }
+    }
+
+    keys
+}
+
+/// Fetch all tick arrays for N pools in as few RPC calls as possible.
+/// Returns a Vec of VecDeques (one per pool) with deserialized TickArrayStates.
+/// keys_per_pool: output of derive_tick_array_keys_for_pool() per pool.
+pub fn fetch_tick_arrays_batch(
+    rpc_client: &RpcClient,
+    keys_per_pool: &[Vec<Pubkey>],
+) -> Result<Vec<VecDeque<raydium_amm_v3::states::TickArrayState>>> {
+    // Flatten all keys, remembering which pool each belongs to
+    let flat_keys: Vec<Pubkey> = keys_per_pool.iter().flatten().cloned().collect();
+    if flat_keys.is_empty() {
+        return Ok(vec![VecDeque::new(); keys_per_pool.len()]);
+    }
+
+    let flat_accounts = fetch_multiple_accounts_chunked(rpc_client, &flat_keys)?;
+
+    // Re-split by pool
+    let mut results: Vec<VecDeque<raydium_amm_v3::states::TickArrayState>> =
+        Vec::with_capacity(keys_per_pool.len());
+    let mut offset = 0;
+    for pool_keys in keys_per_pool {
+        let mut deque = VecDeque::new();
+        for account in flat_accounts[offset..offset + pool_keys.len()].iter() {
+            if let Some(acc) = account {
+                if let Ok(state) =
+                    deserialize_anchor_account::<raydium_amm_v3::states::TickArrayState>(acc)
+                {
+                    deque.push_back(state);
+                }
+            }
+        }
+        results.push(deque);
+        offset += pool_keys.len();
+    }
+
+    Ok(results)
+}
+
+/// Core calculation: same logic as calculate_swap_change() but accepts
+/// pre-fetched, pre-deserialized state. Zero RPC calls.
+/// Call this after fetching all accounts in batch.
+pub fn calculate_swap_change_from_state(
+    raydium_v3_program: Pubkey,
+    pool_id: Pubkey,
+    pool_state: &raydium_amm_v3::states::PoolState,
+    amm_config: &raydium_amm_v3::states::AmmConfig,
+    bitmap_extension: &raydium_amm_v3::states::TickArrayBitmapExtension,
+    mut tick_arrays: VecDeque<raydium_amm_v3::states::TickArrayState>,
+    mint0: &solana_sdk::account::Account,
+    mint1: &solana_sdk::account::Account,
+    user_input_account: &solana_sdk::account::Account,
+    input_token_pubkey: Pubkey,
+    amount: u64,
+    limit_price: Option<f64>,
+    base_in: bool,
+    slippage_bps: u64,
+    epoch: u64,
+) -> Result<ClmmSwapChangeResult> {
+    let mint0_token_program = mint0.owner;
+    let mint1_token_program = mint1.owner;
+    let user_input_state = utils::unpack_token(&user_input_account.data)?;
+    let mint0_state = utils::unpack_mint(&mint0.data)?;
+    let mint1_state = utils::unpack_mint(&mint1.data)?;
+
+    let (
+        zero_for_one,
+        input_vault,
+        output_vault,
+        input_vault_mint,
+        output_vault_mint,
+        input_token_program,
+        output_token_program,
+    ) = if user_input_state.base.mint == pool_state.token_mint_0 {
+        (
+            true,
+            pool_state.token_vault_0,
+            pool_state.token_vault_1,
+            pool_state.token_mint_0,
+            pool_state.token_mint_1,
+            mint0_token_program,
+            mint1_token_program,
+        )
+    } else if user_input_state.base.mint == pool_state.token_mint_1 {
+        (
+            false,
+            pool_state.token_vault_1,
+            pool_state.token_vault_0,
+            pool_state.token_mint_1,
+            pool_state.token_mint_0,
+            mint1_token_program,
+            mint0_token_program,
+        )
+    } else {
+        anyhow::bail!("input token does not match pool vaults");
+    };
+
+    let transfer_fee = if base_in {
+        if zero_for_one {
+            utils::get_transfer_fee(&mint0_state, epoch, amount)
+        } else {
+            utils::get_transfer_fee(&mint1_state, epoch, amount)
+        }
+    } else {
+        0
+    };
+    let amount_specified = amount
+        .checked_sub(transfer_fee)
+        .ok_or_else(|| anyhow::anyhow!("transfer fee exceeds amount"))?;
+
+    let sqrt_price_limit_x64 = limit_price.map(|p| {
+        clmm_math::price_to_sqrt_price_x64(
+            p,
+            pool_state.mint_decimals_0,
+            pool_state.mint_decimals_1,
+        )
+    });
+
+    let (mut other_amount_threshold, tick_array_indexs) = get_out_put_amount_and_remaining_accounts(
+        amount_specified,
+        sqrt_price_limit_x64,
+        zero_for_one,
+        base_in,
+        amm_config.trade_fee_rate,
+        pool_state,
+        bitmap_extension,
+        &mut tick_arrays,
+    )
+    .map_err(|e| anyhow::anyhow!("swap compute failed: {}", e))?;
+
+    let remaining_tick_array_keys = tick_array_indexs
+        .into_iter()
+        .map(|index| {
+            Pubkey::find_program_address(
+                &[
+                    raydium_amm_v3::states::TICK_ARRAY_SEED.as_bytes(),
+                    pool_id.to_bytes().as_ref(),
+                    &index.to_be_bytes(),
+                ],
+                &raydium_v3_program,
+            )
+            .0
+        })
+        .collect();
+
+    if base_in {
+        other_amount_threshold =
+            utils::amount_with_slippage(other_amount_threshold, slippage_bps, false)?;
+    } else {
+        other_amount_threshold =
+            utils::amount_with_slippage(other_amount_threshold, slippage_bps, true)?;
+        let transfer_fee = if zero_for_one {
+            utils::get_transfer_inverse_fee(&mint0_state, epoch, other_amount_threshold)
+        } else {
+            utils::get_transfer_inverse_fee(&mint1_state, epoch, other_amount_threshold)
+        };
+        other_amount_threshold += transfer_fee;
+    }
+
+    Ok(ClmmSwapChangeResult {
+        pool_amm_config: pool_state.amm_config,
+        pool_id,
+        pool_observation: pool_state.observation_key,
+        input_vault,
+        output_vault,
+        input_vault_mint,
+        output_vault_mint,
+        input_token_program,
+        output_token_program,
+        user_input_token: input_token_pubkey,
+        remaining_tick_array_keys,
+        amount,
+        other_amount_threshold,
+        sqrt_price_limit_x64,
+        is_base_input: base_in,
+    })
+}
+
+/// Get the current spot price from PoolState without any RPC call.
+/// Returns price as token1/token0 (e.g. USDC per SOL).
+/// Useful for quick pre-filter before running full swap simulation.
+pub fn get_pool_price_from_state(
+    pool_state: &raydium_amm_v3::states::PoolState,
+) -> f64 {
+    clmm_math::sqrt_price_x64_to_price(
+        pool_state.sqrt_price_x64,
+        pool_state.mint_decimals_0,
+        pool_state.mint_decimals_1,
+    )
+}
+
+/// Chunk a large pubkey list into ≤100-item batches and merge results.
+/// Solana getMultipleAccounts limit is 100 accounts per call.
+fn fetch_multiple_accounts_chunked(
+    rpc_client: &RpcClient,
+    keys: &[Pubkey],
+) -> Result<Vec<Option<solana_sdk::account::Account>>> {
+    const CHUNK_SIZE: usize = 100;
+    let mut results = Vec::with_capacity(keys.len());
+    for chunk in keys.chunks(CHUNK_SIZE) {
+        let chunk_results = rpc_client.get_multiple_accounts(chunk)?;
+        results.extend(chunk_results);
+    }
+    Ok(results)
+}
+
+// ─── End Batch API ────────────────────────────────────────────────────────────
 
 pub fn get_nft_accounts_and_positions_by_owner(
     client: &RpcClient,
