@@ -37,6 +37,49 @@ pub struct ClmmLiquidityChangeResult {
     pub tick_array_upper_start_index: i32,
 }
 
+/// Result of a CLMM swap calculation. Contains everything needed to build
+/// the on-chain swap_v2 instruction.
+///
+/// ## Field Reference
+///
+/// ### Pool accounts (pass directly to swap_v2_instr)
+/// - `pool_amm_config`    - the AmmConfig account governing this pool (fee rate etc.)
+/// - `pool_id`            - the pool state account
+/// - `pool_observation`   - oracle/TWAP observation account
+/// - `input_vault`        - pool vault that holds the input token
+/// - `output_vault`       - pool vault that holds the output token
+///
+/// ### Token mints and programs
+/// - `input_vault_mint`   - mint of the token being swapped IN
+/// - `output_vault_mint`  - mint of the token being received OUT
+/// - `input_token_program`  - SPL Token or Token-2022 program for input mint
+/// - `output_token_program` - SPL Token or Token-2022 program for output mint
+///
+/// ### User accounts
+/// - `user_input_token`   - the USER'S token account for the input token.
+///                          THIS IS CRITICAL: it is set directly from the
+///                          `input_token_pubkey` passed to calculate_swap_change*.
+///                          For buy (SOL→token): must be the WSOL ATA.
+///                          For sell (token→SOL): must be the TOKEN ATA (e.g. USDC ATA).
+///                          Passing the wrong pubkey here causes InsufficientFunds
+///                          because the CLMM program debits from this account.
+///
+/// ### Tick array accounts (remaining_accounts for the instruction)
+/// - `remaining_tick_array_keys` - ordered list of tick array PDAs needed for the swap.
+///                                 Order matters. Prepend the bitmap extension account
+///                                 before passing to swap_v2_instr.
+///
+/// ### Amounts
+/// - `amount`                - the exact input amount in lamports (base_in=true)
+///                             or exact output amount (base_in=false)
+/// - `other_amount_threshold`- slippage-adjusted counterpart:
+///                             base_in=true:  minimum output tokens guaranteed
+///                             base_in=false: maximum input tokens allowed
+///                             For arb profit calculation: sell.other_amount_threshold
+///                             is the minimum SOL received back from the sell leg.
+/// - `sqrt_price_limit_x64` - optional price limit as Q64.64; None = no limit
+/// - `is_base_input`         - true = exact-in swap (you specify input, get output)
+///                             false = exact-out swap (you specify output, give input)
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct ClmmSwapChangeResult {
     pub pool_amm_config: Pubkey,
