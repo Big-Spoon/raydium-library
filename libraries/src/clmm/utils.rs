@@ -438,7 +438,7 @@ pub fn get_out_put_amount_and_remaining_accounts(
 ) -> Result<(u64, VecDeque<i32>), &'static str> {
     let (is_pool_current_tick_array, current_vaild_tick_array_start_index) = pool_state
         .get_first_initialized_tick_array(&Some(*tickarray_bitmap_extension), zero_for_one)
-        .unwrap();
+        .map_err(|_| "InsufficientLiquidityForDirection: no initialized tick array found")?;
 
     let (amount_calculated, tick_array_start_index_vec) = swap_compute(
         zero_for_one,
@@ -506,7 +506,8 @@ fn swap_compute(
         liquidity: pool_state.liquidity,
     };
 
-    let mut tick_array_current = tick_arrays.pop_front().unwrap();
+    let mut tick_array_current = tick_arrays.pop_front()
+        .ok_or("tick_arrays empty at swap_compute start")?;
     if tick_array_current.start_tick_index != current_vaild_tick_array_start_index {
         return Result::Err("tick array start tick index does not match");
     }
@@ -549,8 +550,9 @@ fn swap_compute(
                     current_vaild_tick_array_start_index,
                     zero_for_one,
                 )
-                .unwrap();
-            tick_array_current = tick_arrays.pop_front().unwrap();
+                .map_err(|_| "next_initialized_tick_array_start_index failed")?;
+            tick_array_current = tick_arrays.pop_front()
+                .ok_or("tick_arrays exhausted unexpectedly")?;
             if current_vaild_tick_array_start_index.is_none() {
                 return Result::Err("tick array start tick index out of range limit");
             }
